@@ -10,14 +10,33 @@ import numpy as np
 import soundfile as sf
 from dotenv import load_dotenv
 from supabase import create_client, Client
+import boto3
+from botocore.config import Config
 
 load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
+R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "audios")
+R2_PUBLIC_URL_PREFIX = os.getenv("R2_PUBLIC_URL_PREFIX")
+
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    
+# Cấu hình R2 Client (Frame sườn - sẽ kích hoạt tự động khi bạn điền ENV)
+s3_client = None
+if R2_ACCOUNT_ID and R2_ACCESS_KEY_ID:
+    s3_client = boto3.client(
+        "s3",
+        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=Config(signature_version="s3v4"),
+    )
 
 
 # Ensure outputs directory exists
@@ -114,8 +133,9 @@ async def process_pending_task():
 
         task = response.data[0]
         task_id = task['id']
+        retry_count = task.get('retry_count', 0)
         
-        print(f"Worker: Found pending task {task_id}")
+        print(f"Worker: Found pending task {task_id} (Retry: {retry_count})")
         
         # Cập nhật trạng thái
         supabase.table("audio_tasks").update({"status": "processing"}).eq("id", task_id).execute()
@@ -184,24 +204,54 @@ async def process_pending_task():
         
         sf.write(filepath, audio_array, vieneu_tts.sample_rate, format='WAV', subtype='PCM_16')
         
+        # Khung sườn R2: Khởi tạo R2 URL
+        audio_url = filepath
+        
+        # Nếu có thiết lập kết nối S3 Cloudflare R2
+        # Tạm thời để dưới dạng config chờ sẵn. Hệ thống tự nhận biết khi ENV được kích hoạt
+        if s3_client:
+            try:
+                s3_client.upload_file(filepath, R2_BUCKET_NAME, filename)
+                # Ghép file path public URL
+                if R2_PUBLIC_URL_PREFIX:
+                    audio_url = f"{R2_PUBLIC_URL_PREFIX}/{filename}"
+                    
+                # Xóa file cục bộ để tiết kiệm bộ nhớ khi đã tải lên Cloud
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+            except Exception as s3_err:
+                print(f"S3 Upload failed: {s3_err}")
+                # Vẫn giữ nguyên audio_url dạng local nếu lỗi
+
         # Cập nhật thành công
         supabase.table("audio_tasks").update({
             "status": "completed",
-            "audio_path": filepath
+            "audio_path": audio_url
         }).eq("id", task_id).execute()
         
-        print(f"Worker: Task {task_id} completed. Saved to {filepath}")
+        print(f"Worker: Task {task_id} completed. Saved to {audio_url}")
         
     except Exception as e:
         if 'task_id' in locals():
             try:
-                supabase.table("audio_tasks").update({
-                    "status": "failed",
-                    "error_message": str(e)
-                }).eq("id", task_id).execute()
-            except:
-                pass
-        print(f"Worker: Task failed: {e}")
+                # Quản lý retry count thay vì đánh tạch (failed) luôn
+                if retry_count < 3:
+                    supabase.table("audio_tasks").update({
+                        "status": "pending",
+                        "retry_count": retry_count + 1,
+                        "error_message": f"Lỗi (Chờ Retry {retry_count + 1}/3): {str(e)}"
+                    }).eq("id", task_id).execute()
+                    print(f"Worker: Task {task_id} bị lỗi, sẽ thử lại. Error: {e}")
+                else:
+                    supabase.table("audio_tasks").update({
+                        "status": "failed",
+                        "error_message": f"Lỗi nghiêm trọng (Sụp đổ sau 3 lần thử): {str(e)}"
+                    }).eq("id", task_id).execute()
+                    print(f"Worker: Task {task_id} thất bại hoàn toàn.")
+            except Exception as inner_e:
+                print(f"Worker: Lỗi quá trình update DB Error state: {inner_e}")
+        else:
+            print(f"Worker: Lỗi chung: {e}")
 
 @app.get("/tts")
 def generate_tts(

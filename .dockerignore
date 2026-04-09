@@ -1,0 +1,18 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+env/
+.env
+
+# MacOS
+.DS_Store
+
+# Output files
+outputs/
