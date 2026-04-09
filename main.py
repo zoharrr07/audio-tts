@@ -4,6 +4,24 @@ import shutil
 import tempfile
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import Response
+import asyncio
+import uuid
+import numpy as np
+import soundfile as sf
+from dotenv import load_dotenv
+from supabase import create_client, Client
+
+load_dotenv()
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+supabase: Client = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+# Ensure outputs directory exists
+os.makedirs("outputs", exist_ok=True)
 
 try:
     from vieneu import Vieneu
@@ -58,6 +76,9 @@ vieneu_tts = None
 
 @app.on_event("startup")
 def startup_event():
+    if not supabase:
+        print("Warning: Supabase credentials not found. Worker will fail if it tries to sync.")
+    
     if VIENEU_AVAILABLE:
         try:
             global vieneu_tts
@@ -68,6 +89,119 @@ def startup_event():
             print(f"Error loading Vieneu-TTS: {e}")
     else:
         print("Vieneu-TTS not installed.")
+        
+    # Start the worker loop in the background
+    asyncio.create_task(audio_worker_loop())
+
+async def audio_worker_loop():
+    print("Worker loop started. Waiting for tasks...")
+    while True:
+        try:
+            await process_pending_task()
+        except Exception as e:
+            print(f"Worker Error: {e}")
+        await asyncio.sleep(15)  # Check every 15 seconds
+
+async def process_pending_task():
+    if not supabase:
+        return
+        
+    try:
+        # Lấy một task đang chờ
+        response = supabase.table("audio_tasks").select("*").eq("status", "pending").limit(1).execute()
+        if not response.data or len(response.data) == 0:
+            return
+
+        task = response.data[0]
+        task_id = task['id']
+        
+        print(f"Worker: Found pending task {task_id}")
+        
+        # Cập nhật trạng thái
+        supabase.table("audio_tasks").update({"status": "processing"}).eq("id", task_id).execute()
+
+        if not vieneu_tts:
+            supabase.table("audio_tasks").update({
+                "status": "failed",
+                "error_message": "Vieneu TTS model is not loaded."
+            }).eq("id", task_id).execute()
+            return
+            
+        loop = asyncio.get_event_loop()
+        
+        def run_tts(params):
+            voice_param = params['voice_param']
+            try:
+                voice_feature = vieneu_tts.get_preset_voice(voice_param)
+            except ValueError:
+                if os.path.exists(voice_param):
+                    voice_feature = vieneu_tts.encode_reference(voice_param)
+                else:
+                    raise ValueError(f"Voice '{voice_param}' not found and is not a valid file.")
+            
+            audio_arr = vieneu_tts.infer(
+                text=params['text'], 
+                voice=voice_feature,
+                temperature=params['temperature'],
+                top_k=params['top_k'],
+                max_chars=params['max_chars']
+            )
+            
+            if params['pitch_shift'] != 0 or params['effect_preset']:
+                audio_arr = apply_audio_effects(audio_arr, vieneu_tts.sample_rate, params['pitch_shift'], params['effect_preset'])
+                
+            max_val = np.max(np.abs(audio_arr))
+            if max_val > 1.0:
+                audio_arr = audio_arr / max_val
+                
+            return audio_arr
+            
+        # Map voice param
+        raw_voice = str(task.get("voice", "0"))
+        voice_param = raw_voice
+        if raw_voice == "0":
+            voice_param = "Bích Ngọc (Nữ - Miền Bắc)"
+        elif raw_voice == "1":
+            voice_param = "Phạm Tuyên (Nam - Miền Bắc)"
+        elif raw_voice == "2":
+            voice_param = "Thục Đoan (Nữ - Miền Nam)"
+        elif raw_voice == "3":
+            voice_param = "Xuân Vĩnh (Nam - Miền Nam)"
+            
+        audio_array = await loop.run_in_executor(None, run_tts, {
+            'text': task.get('text', ''),
+            'voice_param': voice_param,
+            'temperature': task.get('temperature', 0.4),
+            'top_k': task.get('top_k', 50),
+            'max_chars': task.get('max_chars', 256),
+            'pitch_shift': task.get('pitch_shift', 0),
+            'effect_preset': task.get('effect_preset')
+        })
+        
+        # Save file
+        filename = f"task_{task_id}_{uuid.uuid4().hex[:8]}.wav"
+        filepath = os.path.join("outputs", filename)
+        
+        sf.write(filepath, audio_array, vieneu_tts.sample_rate, format='WAV', subtype='PCM_16')
+        
+        # Cập nhật thành công
+        supabase.table("audio_tasks").update({
+            "status": "completed",
+            "audio_path": filepath
+        }).eq("id", task_id).execute()
+        
+        print(f"Worker: Task {task_id} completed. Saved to {filepath}")
+        
+    except Exception as e:
+        if 'task_id' in locals():
+            try:
+                supabase.table("audio_tasks").update({
+                    "status": "failed",
+                    "error_message": str(e)
+                }).eq("id", task_id).execute()
+            except:
+                pass
+        print(f"Worker: Task failed: {e}")
 
 @app.get("/tts")
 def generate_tts(

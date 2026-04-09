@@ -4,3 +4,5 @@ python-multipart
 vieneu
 soundfile
 pedalboard==0.9.22
+supabase
+python-dotenv
